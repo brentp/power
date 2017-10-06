@@ -1,4 +1,5 @@
 import hts
+import algorithm
 import strutils
 import sequtils
 import kexpr
@@ -49,16 +50,20 @@ proc gen_from_bgzi(b:BGZI, iv:interval, depth_col:int=3): Gen =
       yield (chrom, start, stop, depth)
 
 iterator meets(depth_cutoff:int, expr:Expr, depths: seq[Gen], names: seq[string]): interval =
-  var heap = new_seq[interval](depths.len)
+  var heap = new_seq[interval]()
   var maxi = new_seq[int](depths.len)
+  var remove = new_seq[int]()
+  var inames = new_seq[string]()
   for i in 0..<depths.len:
-    heap[i] = depths[i]()
-    if expr != nil:
-      discard ke_set_int(expr.ke, names[i], cint(heap[i].depth))
+    var d = depths[i]()
+    if not finished(depths[i]):
+      heap.add(d)
+      if expr != nil:
+        inames.add(names[i])
+        discard ke_set_int(expr.ke, names[i], cint(heap[i].depth))
 
-  var done = false
   var chrom: string
-  while not done:
+  while len(heap) > 0:
     maxi.set_len(0)
     chrom = heap[0].chrom
     var istart = heap[0].start
@@ -88,9 +93,18 @@ iterator meets(depth_cutoff:int, expr:Expr, depths: seq[Gen], names: seq[string]
     for i in maxi:
       heap[i] = depths[i]()
       if finished(depths[i]):
-        done = true
+        remove.add(i)
       if expr != nil:
-        discard ke_set_int(expr.ke, names[i], cint(heap[i].depth))
+        discard ke_set_int(expr.ke, inames[i], cint(heap[i].depth))
+    # we remove any finished element from the heap and from the inames
+    if len(remove) != 0:
+      # remove the higher values 1st so we dont f the indexing
+      reverse(remove)
+      for ir in remove:
+        if expr != nil:
+          inames.delete(ir)
+        heap.delete(ir)
+      remove.set_len(0)
 
 proc bed_line_to_region(line: string): interval =
   var
@@ -133,14 +147,26 @@ proc region_main(cutoff:int, expr:string, bed_regions:string, depths: seq[BGZI],
 
   var regions = bed_to_table(bed_regions)
   var gens = new_seq[Gen](len(depths))
-  var sum: int
   for chrom, regs in regions:
     for reg in regs:
+      var last_stop = 0
+      var last_start = 0
       for i, d in depths:
         gens[i] = d.gen_from_bgzi(reg)
       for iv in meets(cutoff, e, gens, names):
-        sum += iv.stop - iv.start
-      echo sum
+        if iv.start >= iv.stop:
+          stderr.write_line("[mospow] unexpected input from meets():", iv.chrom, ":", iv.start, "-", iv.stop)
+          quit(1)
+
+        if iv.start == last_stop:
+          last_stop = iv.stop
+        else:
+          if last_stop > 0:
+            stdout.write_line(iv.chrom, "\t", last_start, "\t", last_stop)
+          last_start = iv.start
+          last_stop = iv.stop
+      if last_stop > 0:
+        stdout.write_line(chrom, "\t", last_start, "\t", last_stop)
 
 proc get_names(paths: seq[string], expr:string): seq[string] =
   if expr == "": return
@@ -151,6 +177,7 @@ proc get_names(paths: seq[string], expr:string): seq[string] =
     for suffix in @[".gz", ".bed", ".per-base"]:
       if name.ends_with(suffix):
         name = name[0..<(name.len - len(suffix))]
+    name = name.replace("-", "_").replace(".", "_")
     if name.isdigit():
       name = "s" & name
     stderr.write_line("[mospow] using name:", name, " for:", p)
